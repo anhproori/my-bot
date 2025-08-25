@@ -248,5 +248,8 @@ Tự Nhìn Lại Hành Vi Của Mình Và Kiểm Điểm Lại Đi
 
     return "ok"
 
+# ================= RUN FLASK =================
 if __name__ == "__main__":
-    app.run(port=5000)
+    import os
+    port = int(os.environ.get("PORT", 5000))  # Render cung cấp port
+    app.run(host="0.0.0.0", port=port)
