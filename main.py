@@ -1,145 +1,252 @@
-import telebot
-import requests
+import json
 import time
-from flask import Flask
-import threading
+import re
+from pathlib import Path
+import requests
+from flask import Flask, request
 
-# === TOKEN BOT TELEGRAM ===
-TELEGRAM_BOT_TOKEN = "8253965521:AAElcdJVeJTHa-CEAI8BsAdOV7Az6Unftkg"
-bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode="HTML")
+# ================= CONFIG =================
+BOT_TOKEN = "8357599246:AAF6ntHcf7HRBiXIz_ML2pUBcuxT7kE23UE"
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
-# === DANH SÁCH CỔNG PROXY ===
-PROXY_SOURCES = {
-    "1": "0q159x3l1vimi2inghp8245ea5z231lis1mp4d21",
-    "2": "7tm8h1nhocal2d6kaxf87003y1xef72ankxyzc0f",
-    "3": "uwsgsbg2z5rl5xasls6qy8rggo9rs8zcswm10lua",
-}
+LIMIT_FILE = Path("limits.json")
+MUTE_FILE = Path("mute.json")
+SPAM_FILE = Path("spam.json")
+ADMIN_FILE = Path("admin.json")
+REPORT_FILE = Path("report.json")
 
-# === LẤY DANH SÁCH PROXY ===
-def get_proxies(api_key):
-    try:
-        headers = {"Authorization": f"Token {api_key}"}
-        url = "https://proxy.webshare.io/api/v2/proxy/list/?mode=direct"
-        res = requests.get(url, headers=headers, timeout=10)
-        res.raise_for_status()
-        return res.json().get("results", [])
-    except:
-        return []
+# ================= UTILITIES =================
+def api_request(method, params=None):
+    if params is None:
+        params = {}
+    res = requests.post(f"{API_URL}{method}", data=params).json()
+    if res.get("error_code") == 429:
+        retry = res.get("parameters", {}).get("retry_after", 1)
+        time.sleep(retry)
+        return api_request(method, params)
+    return res
 
-# === LẤY QUỐC GIA IP ===
-def get_country(ip):
-    try:
-        res = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
-        data = res.json()
-        country = data.get("country", "❓")
-        region = data.get("region", "")
-        return f"🌍 <b>{country}</b> - {region}"
-    except:
-        return "🌍 <i>Không xác định</i>"
+def get_data(file_path):
+    if not file_path.exists():
+        file_path.write_text("{}")
+    return json.loads(file_path.read_text())
 
-# === KIỂM TRA TỐC ĐỘ PROXY ===
-def test_proxy_speed(proxy):
-    try:
-        proxies = {
-            "http": f"http://{proxy['username']}:{proxy['password']}@{proxy['proxy_address']}:{proxy['port']}",
-            "https": f"http://{proxy['username']}:{proxy['password']}@{proxy['proxy_address']}:{proxy['port']}"
-        }
-        start = time.time()
-        res = requests.get("https://www.google.com", proxies=proxies, timeout=5)
-        if res.status_code == 200:
-            speed = round((time.time() - start) * 1000)
-            return f"⚡ <b>Tốc độ:</b> <code>{speed}ms</code>"
-    except:
-        return "⚠️ <i>Timeout hoặc lỗi</i>"
+def save_data(file_path, data):
+    file_path.write_text(json.dumps(data, ensure_ascii=False, indent=4))
 
-# === /start ===
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    welcome = (
-        "🎉 <b>CHÀO MỪNG ĐẾN KING TOOL PROXY</b> 🎉\n\n"
-        "🤖 <b>Bot hỗ trợ lấy proxy từ nhiều nguồn chất lượng!</b>\n\n"
-        "📌 <b>Lệnh sử dụng:</b>\n"
-        "🔹 <code>/get_proxy số_lượng cổng</code> – Lấy proxy\n"
-        "🔹 <code>/ds_proxy</code> – Danh sách cổng hoạt động\n"
-        "🔹 <code>/ping</code> – Kiểm tra bot\n\n"
-        "📥 Ví dụ: <code>/get_proxy 5 1</code>\n"
-        "💡 Tối đa <b>10 proxy</b> mỗi lần yêu cầu."
-    )
-    bot.reply_to(message, welcome)
+# ================= COOLDOWN =================
+limits = get_data(LIMIT_FILE)
+def check_cooldown(chat_id, user_id, command, cooldown=180):
+    now = int(time.time())
+    limits.setdefault(str(chat_id), {}).setdefault(str(user_id), {})
+    last = limits[str(chat_id)][str(user_id)].get(command, 0)
+    if now - last < cooldown:
+        return cooldown - (now - last)
+    limits[str(chat_id)][str(user_id)][command] = now
+    save_data(LIMIT_FILE, limits)
+    return 0
 
-# === /get_proxy ===
-@bot.message_handler(commands=['get_proxy'])
-def handle_getproxy(message):
-    args = message.text.split()
-    if len(args) < 3:
-        bot.reply_to(message, "⚠️ Nhập đúng cú pháp: <code>/get_proxy số_lượng cổng</code>")
-        return
+# ================= MUTE / UNMUTE =================
+def mute_user(chat_id, user_id, minutes, name, username, reason=""):
+    until = int(time.time()) + minutes*60
+    api_request("restrictChatMember", {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "permissions": json.dumps({
+            "can_send_messages": False,
+            "can_send_media_messages": False,
+            "can_send_polls": False,
+            "can_send_other_messages": False,
+            "can_add_web_page_previews": False,
+            "can_change_info": False,
+            "can_invite_users": False,
+            "can_pin_messages": False
+        }),
+        "until_date": until
+    })
+    mute = get_data(MUTE_FILE)
+    mute.setdefault(str(chat_id), {})[str(user_id)] = {
+        "name": name, "username": username, "until": until, "reason": reason
+    }
+    save_data(MUTE_FILE, mute)
 
-    try:
-        amount = min(int(args[1]), 10)
-        port = args[2]
-        api_key = PROXY_SOURCES.get(port)
-        if not api_key:
-            bot.reply_to(message, "❌ Cổng không tồn tại. Dùng <code>/ds_proxy</code> để kiểm tra.")
-            return
+def unmute_user(chat_id, user_id):
+    api_request("restrictChatMember", {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "permissions": json.dumps({
+            "can_send_messages": True,
+            "can_send_media_messages": True,
+            "can_send_polls": True,
+            "can_send_other_messages": True,
+            "can_add_web_page_previews": True,
+            "can_change_info": False,
+            "can_invite_users": True,
+            "can_pin_messages": False
+        })
+    })
+    mute = get_data(MUTE_FILE)
+    if str(chat_id) in mute and str(user_id) in mute[str(chat_id)]:
+        del mute[str(chat_id)][str(user_id)]
+    save_data(MUTE_FILE, mute)
 
-        bot.reply_to(message, f"⏳ <b>Đang lấy {amount} proxy từ cổng {port}...</b>")
+# ================= SPAM DETECTION =================
+def check_spam(chat_id, user_id, message_id, name, username):
+    spam = get_data(SPAM_FILE)
+    now = int(time.time())
+    spam.setdefault(str(chat_id), {}).setdefault(str(user_id), [])
+    spam[str(chat_id)][str(user_id)].append(now)
+    spam[str(chat_id)][str(user_id)] = [t for t in spam[str(chat_id)][str(user_id)] if t > now-5]
+    if len(spam[str(chat_id)][str(user_id)]) > 5:
+        mute_user(chat_id, user_id, 5, name, username, "Spam")
+        api_request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+        api_request("sendMessage", {
+            "chat_id": chat_id,
+            "parse_mode": "HTML",
+            "text": f"🚨 <b>PHÁT HIỆN SPAM</b>\n━━━━━━━━━━━━━━\n🙍 Thành viên: <a href='tg://user?id={user_id}'>{name}</a>\n⏰ Thời gian cấm chat: <b>5 phút</b>\n📌 Lý do: <i>Spam tin nhắn</i>\n━━━━━━━━━━━━━━"
+        })
+        spam[str(chat_id)][str(user_id)] = []
+    save_data(SPAM_FILE, spam)
 
-        proxies = get_proxies(api_key)
-        if not proxies:
-            bot.send_message(message.chat.id, "⚠️ Không tìm thấy proxy từ API hoặc lỗi kết nối.")
-            return
+# ================= PERMISSIONS =================
+def has_permission(admin_bot, is_admin_group):
+    return admin_bot or is_admin_group
 
-        for idx, proxy in enumerate(proxies[:amount], 1):
-            ip = proxy["proxy_address"]
-            country = get_country(ip)
-            speed = test_proxy_speed(proxy)
-            msg = (
-                f"<b>🎯 PROXY #{idx}</b>\n"
-                f"<pre>━━━━━━━━━━━━━━━━━━━━━━</pre>\n"
-                f"🔐 <b>Tài khoản:</b> <code>{proxy['username']}</code>\n"
-                f"🔑 <b>Mật khẩu:</b> <code>{proxy['password']}</code>\n"
-                f"🌐 <b>IP:</b> <code>{ip}</code>\n"
-                f"📦 <b>Cổng:</b> <code>{proxy['port']}</code>\n"
-                f"{country}\n"
-                f"{speed}\n"
-                f"<pre>━━━━━━━━━━━━━━━━━━━━━━</pre>"
-            )
-            bot.send_message(message.chat.id, msg)
-            time.sleep(1.5)
+# ================= FLASK BOT =================
+app = Flask(__name__)
 
-    except ValueError:
-        bot.reply_to(message, "❌ Số lượng phải là số nguyên.")
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = request.json
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return "ok"
 
-# === /ds_proxy ===
-@bot.message_handler(commands=['ds_proxy'])
-def handle_ds_proxy(message):
-    msg = "<b>📡 DANH SÁCH TRẠNG THÁI CỔNG:</b>\n\n"
-    for port, api_key in PROXY_SOURCES.items():
-        proxies = get_proxies(api_key)
-        status = "✅ <b>Hoạt động</b>" if proxies else "❌ <b>Lỗi hoặc không phản hồi</b>"
-        msg += f"🔌 <b>Cổng {port}:</b> {status}\n"
-    bot.reply_to(message, msg)
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    name = message["from"].get("first_name", "")
+    username = message["from"].get("username", "")
+    text = (message.get("text") or "").strip()
+    reply = message.get("reply_to_message")
 
-# === /ping ===
-@bot.message_handler(commands=['ping'])
-def handle_ping(message):
-    bot.reply_to(message, "✅ Bot đang hoạt động tốt!")
+    check_spam(chat_id, user_id, message["message_id"], name, username)
 
-# === FLASK UPTIMEROBOT ===
-app = Flask('')
+    admins_bot = get_data(ADMIN_FILE)
+    admins_response = api_request("getChatAdministrators", {"chat_id": chat_id})
+    group_admins = admins_response.get("result", [])
+    is_admin = any(a.get("user", {}).get("id") == user_id for a in group_admins)
+    is_admin_bot = str(chat_id) in admins_bot and str(user_id) in admins_bot[str(chat_id)]
 
-@app.route('/')
-def home():
-    return "Bot Đang Hoạt Động!"
+    # ================= COMMANDS =================
+    # vipham
+    m = re.match(r"^vipham(?:\s+(\d+))?(?:\s+(.+))?$", text, re.I)
+    if m and reply:
+        if not has_permission(is_admin_bot, is_admin):
+            return "ok"
+        minutes = int(m.group(1)) if m.group(1) else 5
+        reason = m.group(2).strip() if m.group(2) else "Không có"
+        target = reply["from"]
+        mute_user(chat_id, target["id"], minutes, target.get("first_name",""), target.get("username",""), reason)
+        msg = f"""🚫 <b>THÀNH VIÊN VI PHẠM</b>
+Tự Nhìn Lại Hành Vi Của Mình Và Kiểm Điểm Lại Đi
+━━━━━━━━━━━━━━
+📛 Nhóm: <b>{message['chat'].get('title','')}</b>
+🙍 Thành viên: <a href='tg://user?id={target['id']}'>{target.get('first_name','')}</a>
+⏰ Thời gian cấm chat: <b>{minutes} phút</b>
+📌 Lý do: <i>{reason}</i>
+👮 Người báo cáo: <a href='tg://user?id={user_id}'>{name}</a>
+━━━━━━━━━━━━━━"""
+        api_request("sendMessage", {"chat_id": chat_id, "parse_mode": "HTML", "text": msg})
+        return "ok"
 
-def run():
-    app.run(host="0.0.0.0", port=8080)
+    # mochanchat
+    m = re.match(r"^mochanchat(?:\s+@?(\S+))?", text, re.I)
+    if m:
+        if not has_permission(is_admin_bot, is_admin):
+            return "ok"
+        mute = get_data(MUTE_FILE)
+        target = None
+        if reply:
+            target = reply["from"]
+        elif m.group(1) and str(chat_id) in mute:
+            for uid, info in mute[str(chat_id)].items():
+                if info.get("username","").lower() == m.group(1).lower():
+                    target = {"id": int(uid), "first_name": info["name"]}
+                    break
+        if target:
+            unmute_user(chat_id, target["id"])
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":
+                f"🔓 <b>ĐÃ MỞ CHẶN CHAT</b>\n━━━━━━━━━━━━━━\n🙍 Thành viên: <a href='tg://user?id={target['id']}'>{target['first_name']}</a>\n👮 Người thực hiện: <a href='tg://user?id={user_id}'>{name}</a>\n━━━━━━━━━━━━━━"})
+        else:
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":"⚠️ Không tìm thấy thành viên để mở chặn!"})
+        return "ok"
 
-def keep_alive():
-    t = threading.Thread(target=run)
-    t.start()
+    # addadmin
+    if text.lower() == "addadmin":
+        if not is_admin:
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":"⚠️ Bạn không có quyền thêm admin!"})
+            return "ok"
+        if not reply:
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":"⚠️ Vui lòng reply tin nhắn muốn thêm admin!"})
+            return "ok"
+        target_id = reply["from"]["id"]
+        uname = (reply["from"].get("username") or reply["from"].get("first_name")).lower()
+        admins_bot.setdefault(str(chat_id), {})[str(target_id)] = {"username": uname}
+        save_data(ADMIN_FILE, admins_bot)
+        api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":f"✅ Đã thêm <b>@{uname}</b> làm admin bot!"})
+        return "ok"
 
-# === KHỞI ĐỘNG BOT ===
-keep_alive()
-bot.polling(none_stop=True)
+    # removeadmin
+    if text.lower() == "removeadmin":
+        if not is_admin:
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":"⚠️ Bạn không có quyền xóa admin!"})
+            return "ok"
+        if not reply:
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":"⚠️ Vui lòng reply tin nhắn muốn xóa admin!"})
+            return "ok"
+        target_id = reply["from"]["id"]
+        uname = (reply["from"].get("username") or reply["from"].get("first_name")).lower()
+        if str(chat_id) in admins_bot and str(target_id) in admins_bot[str(chat_id)]:
+            del admins_bot[str(chat_id)][str(target_id)]
+            save_data(ADMIN_FILE, admins_bot)
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":f"✅ Đã xóa <b>@{uname}</b> khỏi admin bot!"})
+        else:
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":"⚠️ Người dùng này không phải admin bot!"})
+        return "ok"
+
+    # baocao
+    if text.lower() == "baocao" and reply:
+        target = reply["from"]
+        reports = get_data(REPORT_FILE)
+        reports.setdefault(str(chat_id), {}).setdefault(str(target["id"]), [])
+        if user_id not in reports[str(chat_id)][str(target["id"])]:
+            reports[str(chat_id)][str(target["id"])].append(user_id)
+        count = len(reports[str(chat_id)][str(target["id"])])
+        need = 3
+        if count >= need:
+            mute_user(chat_id, target["id"], 10, target.get("first_name",""), target.get("username",""), "Bị Báo Cáo")
+            del reports[str(chat_id)][str(target["id"])]
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":
+                f"🚫 <b>THÀNH VIÊN BỊ CẤM CHAT</b>\n━━━━━━━━━━━━━━\n🙍 <a href='tg://user?id={target['id']}'>{target.get('first_name','')}</a>\n📌 Lý do: <i>Bị Báo Cáo</i>\n⏰ Thời gian cấm chat: <b>10 phút</b>\n━━━━━━━━━━━━━━"})
+        else:
+            api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":
+                f"⚠️ <b>Report đã được ghi nhận</b>\n━━━━━━━━━━━━━━\n🙍 Thành viên: <a href='tg://user?id={target['id']}'>{target.get('first_name','')}</a>\n📊 Số lần báo cáo: {count}/{need}\n━━━━━━━━━━━━━━"})
+        save_data(REPORT_FILE, reports)
+        return "ok"
+
+    # alladmin
+    if text.lower() == "alladmin":
+        admins = api_request("getChatAdministrators", {"chat_id": chat_id})
+        msg = "📋 <b>DANH SÁCH QUẢN TRỊ VIÊN</b>\n\n"
+        for a in admins.get("result", []):
+            user = a.get("user", {})
+            role = "👑" if a.get("status") == "creator" else "🛡️"
+            uname = user.get("username","")
+            msg += f"{role} {user.get('first_name','')} " + (f"(@{uname})" if uname else "") + "\n\n"
+        api_request("sendMessage", {"chat_id": chat_id, "parse_mode":"HTML", "text":msg})
+        return "ok"
+
+    return "ok"
+
+if __name__ == "__main__":
+    app.run(port=5000)
