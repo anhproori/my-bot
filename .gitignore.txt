@@ -1,3 +1,0 @@
-node_modules
-message_id.txt
-last_content.txt
